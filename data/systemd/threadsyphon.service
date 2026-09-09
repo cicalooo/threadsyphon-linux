@@ -1,0 +1,13 @@
+[Unit]
+Description=threadsyphon headless thread watcher
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/threadsyphon watch
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

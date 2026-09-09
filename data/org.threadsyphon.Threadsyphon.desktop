@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=threadsyphon
+GenericName=Thread media watcher
+Comment=Watch 4chan threads and save their media
+Exec=threadsyphon
+Icon=threadsyphon
+Terminal=false
+Type=Application
+Categories=Network;Utility;
+Keywords=4chan;download;watcher;media;
+StartupNotify=true

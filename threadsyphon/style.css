@@ -1,0 +1,50 @@
+.status-dot {
+  min-width: 8px;
+  min-height: 8px;
+  border-radius: 99px;
+  background: alpha(@window_fg_color, 0.28);
+}
+
+.status-dot.watching,
+.status-dot.checking,
+.status-dot.starting,
+.status-dot.downloading,
+.status-dot.verifying {
+  background: @accent_bg_color;
+}
+
+.status-dot.paused,
+.status-dot.retrying {
+  background: @warning_color;
+}
+
+.status-dot.complete {
+  background: @success_color;
+}
+
+.status-dot.error {
+  background: @error_color;
+}
+
+.thread-row {
+  padding: 2px 0;
+}
+
+.stat-value {
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.numeric {
+  font-variant-numeric: tabular-nums;
+}
+
+.thumb {
+  border-radius: 8px;
+  background: alpha(@window_fg_color, 0.06);
+}
+
+.log-view {
+  font-size: 12px;
+  padding: 8px;
+}
