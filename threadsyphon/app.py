@@ -243,11 +243,17 @@ class FindResultRow(Gtk.ListBoxRow):
     def __init__(self, hit: CatalogThread) -> None:
         super().__init__()
         self.hit = hit
+        self.set_activatable(True)
         box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
         box.set_margin_start(10)
         box.set_margin_end(10)
         box.set_margin_top(8)
         box.set_margin_bottom(8)
+        self.check = Gtk.CheckButton()
+        self.check.set_valign(Gtk.Align.CENTER)
+        # Keep row activation and checkbox in sync without fighting ListBox selection.
+        self.check.connect("toggled", self._on_check_toggled)
+        box.append(self.check)
         mid = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
         mid.set_hexpand(True)
         title = Gtk.Label(xalign=0, label=hit.display_title)
@@ -263,14 +269,38 @@ class FindResultRow(Gtk.ListBoxRow):
         mid.append(sub)
         box.append(mid)
         self.set_child(box)
+        self._syncing = False
+
+    def _on_check_toggled(self, button: Gtk.CheckButton) -> None:
+        if self._syncing:
+            return
+        # No-op beyond state; selection is driven by checkbox.
+
+    def set_checked(self, checked: bool) -> None:
+        if self.check.get_active() == checked:
+            return
+        self._syncing = True
+        self.check.set_active(checked)
+        self._syncing = False
+
+    def is_checked(self) -> bool:
+        return bool(self.check.get_active())
 
 
 class FindDialog(Adw.Window):
     def __init__(self, parent: "ThreadsyphonWindow") -> None:
-        super().__init__(transient_for=parent, title="Find threads", modal=True, default_width=560, default_height=520)
+        super().__init__(
+            transient_for=parent,
+            title="Find threads",
+            modal=True,
+            default_width=560,
+            default_height=520,
+        )
+        self.set_hide_on_close(True)
         self.parent_win = parent
         self.catalog = parent.catalog
         self._hits: list[CatalogThread] = []
+        self._search_gen = 0
 
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         self.set_content(root)
@@ -290,7 +320,7 @@ class FindDialog(Adw.Window):
 
         hint = Gtk.Label(
             xalign=0,
-            label='Title only: /caig/   or   title:"/caig/"   or   title=:"/caig/ c ai general"  ·  body:…  ·  min_images:10',
+            label='Title only: /caig/   or   title:"/caig/"   or   title=:"/caig/ c ai general"  ·  Tick rows to select/deselect',
         )
         hint.add_css_class("dim-label")
         hint.add_css_class("caption")
@@ -321,16 +351,53 @@ class FindDialog(Adw.Window):
         scroll.set_vexpand(True)
         scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         self.list = Gtk.ListBox()
-        self.list.set_selection_mode(Gtk.SelectionMode.MULTIPLE)
+        # NONE: selection is via checkboxes (GTK multi-select deselect is awkward).
+        self.list.set_selection_mode(Gtk.SelectionMode.NONE)
+        self.list.set_activate_on_single_click(True)
+        self.list.connect("row-activated", self._row_activated)
         scroll.set_child(self.list)
         body.append(scroll)
 
         actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        actions.set_halign(Gtk.Align.END)
+        select_all = Gtk.Button(label="Select all")
+        select_all.add_css_class("flat")
+        select_all.connect("clicked", lambda *_: self._set_all(True))
+        actions.append(select_all)
+        clear_sel = Gtk.Button(label="Deselect all")
+        clear_sel.add_css_class("flat")
+        clear_sel.connect("clicked", lambda *_: self._set_all(False))
+        actions.append(clear_sel)
+        spacer = Gtk.Box()
+        spacer.set_hexpand(True)
+        actions.append(spacer)
         add_btn = Gtk.Button(label="Add selected")
+        add_btn.add_css_class("suggested-action")
         add_btn.connect("clicked", lambda *_: self._add_selected())
         actions.append(add_btn)
         body.append(actions)
+
+    def _iter_rows(self) -> list[FindResultRow]:
+        rows: list[FindResultRow] = []
+        i = 0
+        while True:
+            row = self.list.get_row_at_index(i)
+            if row is None:
+                break
+            if isinstance(row, FindResultRow):
+                rows.append(row)
+            i += 1
+        return rows
+
+    def _row_activated(self, _list: Gtk.ListBox, row: Gtk.ListBoxRow) -> None:
+        if isinstance(row, FindResultRow):
+            row.set_checked(not row.is_checked())
+
+    def _set_all(self, checked: bool) -> None:
+        for row in self._iter_rows():
+            row.set_checked(checked)
+        n = sum(1 for r in self._iter_rows() if r.is_checked())
+        total = len(self._iter_rows())
+        self.status.set_text(f"{n}/{total} selected" if total else "No results.")
 
     def _clear_results(self) -> None:
         while True:
@@ -345,6 +412,8 @@ class FindDialog(Adw.Window):
         query = self.query.get_text().strip()
         self.status.set_text("Searching…")
         self._clear_results()
+        self._search_gen += 1
+        gen = self._search_gen
 
         def work() -> None:
             try:
@@ -356,13 +425,19 @@ class FindDialog(Adw.Window):
                 err = str(error)
 
             def done() -> bool:
+                if gen != self._search_gen:
+                    return False
                 if err:
                     self.status.set_text(err)
                     return False
                 self._hits = hits
                 for hit in hits[:200]:
                     self.list.append(FindResultRow(hit))
-                self.status.set_text(f"{len(hits)} match(es)" + (" — showing first 200" if len(hits) > 200 else ""))
+                shown = min(len(hits), 200)
+                extra = " — showing first 200" if len(hits) > 200 else ""
+                self.status.set_text(f"{len(hits)} match(es){extra}. Click a row or tick to select.")
+                if shown == 0:
+                    self.status.set_text("0 matches.")
                 return False
 
             GLib.idle_add(done)
@@ -370,16 +445,17 @@ class FindDialog(Adw.Window):
         threading.Thread(target=work, daemon=True).start()
 
     def _add_selected(self) -> None:
-        rows = list(self.list.get_selected_rows())
+        rows = [r for r in self._iter_rows() if r.is_checked()]
         if not rows:
-            self.status.set_text("Select one or more threads first.")
+            self.status.set_text("Select one or more threads first (tick or click a row).")
             return
         added = 0
         for row in rows:
-            if isinstance(row, FindResultRow):
-                if self.parent_win.add_catalog_hit(row.hit):
-                    added += 1
-        self.status.set_text(f"Added {added} thread(s).")
+            if self.parent_win.add_catalog_hit(row.hit):
+                added += 1
+            row.set_checked(False)
+        left = len(self._iter_rows())
+        self.status.set_text(f"Added {added}. Selection cleared ({left} still listed).")
         if added:
             self.parent_win._toast(f"Added {added} from Find")
 
@@ -387,6 +463,7 @@ class FindDialog(Adw.Window):
 class RuleEditDialog(Adw.Window):
     def __init__(self, parent: Gtk.Window, rule: WatchRule | None, on_save) -> None:
         super().__init__(transient_for=parent, title="Edit rule" if rule else "New rule", modal=True, default_width=460)
+        self.set_hide_on_close(True)
         self.on_save = on_save
         self.rule_id = rule.id if rule else ""
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
@@ -468,12 +545,23 @@ class RuleEditDialog(Adw.Window):
 
 class RulesWindow(Adw.Window):
     def __init__(self, parent: "ThreadsyphonWindow") -> None:
-        super().__init__(transient_for=parent, title="Watchdog rules", modal=False, default_width=520, default_height=420)
+        super().__init__(
+            transient_for=parent,
+            title="Watchdog rules",
+            modal=False,
+            default_width=520,
+            default_height=420,
+        )
+        # Hide instead of destroy so Close always works; parent clears ref on close-request.
+        self.set_hide_on_close(True)
         self.parent_win = parent
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         self.set_content(root)
         header = Adw.HeaderBar()
         root.append(header)
+        close = Gtk.Button(label="Close")
+        close.connect("clicked", lambda *_: self._request_close())
+        header.pack_start(close)
         add = Gtk.Button(label="Add rule")
         add.add_css_class("suggested-action")
         add.connect("clicked", lambda *_: self._edit(None))
@@ -495,13 +583,28 @@ class RulesWindow(Adw.Window):
         note.set_wrap(True)
         body.append(note)
 
+        self.empty = Gtk.Label(xalign=0, label="")
+        self.empty.add_css_class("dim-label")
+        body.append(self.empty)
+
         scroll = Gtk.ScrolledWindow()
         scroll.set_vexpand(True)
         self.list = Gtk.ListBox()
         self.list.set_selection_mode(Gtk.SelectionMode.NONE)
         scroll.set_child(self.list)
         body.append(scroll)
+        self.connect("close-request", self._on_close_request)
         self.reload()
+
+    def _request_close(self) -> None:
+        self.close()
+
+    def _on_close_request(self, *_a) -> bool:
+        # Drop singleton ref so a fresh window can open later.
+        if self.parent_win is not None and getattr(self.parent_win, "_rules_window", None) is self:
+            self.parent_win._rules_window = None
+        self.hide()
+        return True  # we handled close (hide)
 
     def reload(self) -> None:
         while True:
@@ -509,11 +612,17 @@ class RulesWindow(Adw.Window):
             if row is None:
                 break
             self.list.remove(row)
-        for rule in self.parent_win.store.rules:
+        rules = list(self.parent_win.store.rules)
+        for rule in rules:
             self.list.append(self._row(rule))
+        if not rules:
+            self.empty.set_text("No rules. Add one, or Close this window.")
+        else:
+            self.empty.set_text(f"{len(rules)} rule(s).")
 
     def _row(self, rule: WatchRule) -> Gtk.ListBoxRow:
         row = Gtk.ListBoxRow()
+        row.set_activatable(False)
         box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         box.set_margin_start(10)
         box.set_margin_end(10)
@@ -575,6 +684,9 @@ class RulesWindow(Adw.Window):
         self.parent_win.store.rules = [r for r in self.parent_win.store.rules if r.id != rule_id]
         self.parent_win._rules_changed()
         self.reload()
+        # After clearing the last rule, close the watchdog window.
+        if not self.parent_win.store.rules:
+            self._request_close()
 
 
 class ThreadsyphonWindow(Adw.ApplicationWindow):
@@ -1012,10 +1124,14 @@ class ThreadsyphonWindow(Adw.ApplicationWindow):
         FindDialog(self).present()
 
     def _open_rules(self) -> None:
-        if self._rules_window is None:
+        win = self._rules_window
+        if win is None:
             self._rules_window = RulesWindow(self)
         else:
-            self._rules_window.reload()
+            try:
+                self._rules_window.reload()
+            except Exception:
+                self._rules_window = RulesWindow(self)
         self._rules_window.present()
 
     def add_catalog_hit(self, hit: CatalogThread, label: str = "") -> bool:
