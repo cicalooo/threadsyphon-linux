@@ -19,16 +19,20 @@ gi.require_version("Pango", "1.0")
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk, Pango
 
 from . import __version__
+from .catalog import CatalogClient, CatalogThread, search_catalog
 from .engine import WatchManager, format_bytes
 from .models import (
     FILENAME_MODES,
     MEDIA_FILTERS,
     AppSettings,
     ThreadConfig,
+    WatchRule,
     default_download_dir,
     default_root,
     parse_thread_url,
 )
+from .query import parse_query
+from .scout import RuleScout
 from .storage import ConfigStore
 
 try:
@@ -234,6 +238,345 @@ class PreferencesWindow(Adw.PreferencesWindow):
         return False
 
 
+
+class FindResultRow(Gtk.ListBoxRow):
+    def __init__(self, hit: CatalogThread) -> None:
+        super().__init__()
+        self.hit = hit
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        box.set_margin_start(10)
+        box.set_margin_end(10)
+        box.set_margin_top(8)
+        box.set_margin_bottom(8)
+        mid = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        mid.set_hexpand(True)
+        title = Gtk.Label(xalign=0, label=hit.display_title)
+        title.add_css_class("heading")
+        title.set_ellipsize(Pango.EllipsizeMode.END)
+        sub = Gtk.Label(
+            xalign=0,
+            label=f"{hit.short_id}  ·  {hit.replies} replies  ·  {hit.images} images",
+        )
+        sub.add_css_class("dim-label")
+        sub.add_css_class("caption")
+        mid.append(title)
+        mid.append(sub)
+        box.append(mid)
+        self.set_child(box)
+
+
+class FindDialog(Adw.Window):
+    def __init__(self, parent: "ThreadsyphonWindow") -> None:
+        super().__init__(transient_for=parent, title="Find threads", modal=True, default_width=560, default_height=520)
+        self.parent_win = parent
+        self.catalog = parent.catalog
+        self._hits: list[CatalogThread] = []
+
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.set_content(root)
+        header = Adw.HeaderBar()
+        root.append(header)
+        close = Gtk.Button(label="Close")
+        close.connect("clicked", lambda *_: self.close())
+        header.pack_start(close)
+
+        body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        body.set_margin_start(16)
+        body.set_margin_end(16)
+        body.set_margin_top(8)
+        body.set_margin_bottom(16)
+        body.set_vexpand(True)
+        root.append(body)
+
+        hint = Gtk.Label(
+            xalign=0,
+            label='Filter: linux  ·  title:"daily" OR body:arch  ·  min_images:10  ·  id:123  ·  -sticky:true',
+        )
+        hint.add_css_class("dim-label")
+        hint.add_css_class("caption")
+        hint.set_wrap(True)
+        body.append(hint)
+
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.board = Gtk.Entry(text="g")
+        self.board.set_placeholder_text("board")
+        self.board.set_width_chars(6)
+        row.append(self.board)
+        self.query = Gtk.Entry()
+        self.query.set_placeholder_text("title, body, id, min_images…")
+        self.query.set_hexpand(True)
+        self.query.connect("activate", lambda *_: self._search())
+        row.append(self.query)
+        search_btn = Gtk.Button(label="Search")
+        search_btn.add_css_class("suggested-action")
+        search_btn.connect("clicked", lambda *_: self._search())
+        row.append(search_btn)
+        body.append(row)
+
+        self.status = Gtk.Label(xalign=0, label="Enter a board and query, then Search.")
+        self.status.add_css_class("dim-label")
+        body.append(self.status)
+
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_vexpand(True)
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self.list = Gtk.ListBox()
+        self.list.set_selection_mode(Gtk.SelectionMode.MULTIPLE)
+        scroll.set_child(self.list)
+        body.append(scroll)
+
+        actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        actions.set_halign(Gtk.Align.END)
+        add_btn = Gtk.Button(label="Add selected")
+        add_btn.connect("clicked", lambda *_: self._add_selected())
+        actions.append(add_btn)
+        body.append(actions)
+
+    def _clear_results(self) -> None:
+        while True:
+            row = self.list.get_row_at_index(0)
+            if row is None:
+                break
+            self.list.remove(row)
+        self._hits = []
+
+    def _search(self) -> None:
+        board = self.board.get_text().strip()
+        query = self.query.get_text().strip()
+        self.status.set_text("Searching…")
+        self._clear_results()
+
+        def work() -> None:
+            try:
+                parse_query(query)
+                hits = search_catalog(self.catalog, board, query)
+                err = ""
+            except Exception as error:
+                hits = []
+                err = str(error)
+
+            def done() -> bool:
+                if err:
+                    self.status.set_text(err)
+                    return False
+                self._hits = hits
+                for hit in hits[:200]:
+                    self.list.append(FindResultRow(hit))
+                self.status.set_text(f"{len(hits)} match(es)" + (" — showing first 200" if len(hits) > 200 else ""))
+                return False
+
+            GLib.idle_add(done)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _add_selected(self) -> None:
+        rows = list(self.list.get_selected_rows())
+        if not rows:
+            self.status.set_text("Select one or more threads first.")
+            return
+        added = 0
+        for row in rows:
+            if isinstance(row, FindResultRow):
+                if self.parent_win.add_catalog_hit(row.hit):
+                    added += 1
+        self.status.set_text(f"Added {added} thread(s).")
+        if added:
+            self.parent_win._toast(f"Added {added} from Find")
+
+
+class RuleEditDialog(Adw.Window):
+    def __init__(self, parent: Gtk.Window, rule: WatchRule | None, on_save) -> None:
+        super().__init__(transient_for=parent, title="Edit rule" if rule else "New rule", modal=True, default_width=460)
+        self.on_save = on_save
+        self.rule_id = rule.id if rule else ""
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.set_content(root)
+        header = Adw.HeaderBar()
+        root.append(header)
+        cancel = Gtk.Button(label="Cancel")
+        cancel.connect("clicked", lambda *_: self.close())
+        header.pack_start(cancel)
+        save = Gtk.Button(label="Save")
+        save.add_css_class("suggested-action")
+        save.connect("clicked", lambda *_: self._save())
+        header.pack_end(save)
+
+        body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        body.set_margin_start(16)
+        body.set_margin_end(16)
+        body.set_margin_top(8)
+        body.set_margin_bottom(16)
+        root.append(body)
+
+        self.name = Gtk.Entry(text=(rule.name if rule else ""), placeholder_text="Name")
+        body.append(self.name)
+        row = Gtk.Box(spacing=8)
+        self.board = Gtk.Entry(text=(rule.board if rule else "g"), placeholder_text="board")
+        self.board.set_width_chars(8)
+        row.append(self.board)
+        self.query = Gtk.Entry(text=(rule.query if rule else ""), placeholder_text="query filter")
+        self.query.set_hexpand(True)
+        row.append(self.query)
+        body.append(row)
+
+        row2 = Gtk.Box(spacing=8)
+        row2.append(Gtk.Label(label="Scout every"))
+        self.interval = Gtk.SpinButton.new_with_range(60, 3600, 30)
+        self.interval.set_value(rule.interval if rule else 120)
+        row2.append(self.interval)
+        row2.append(Gtk.Label(label="s · max add"))
+        self.limit = Gtk.SpinButton.new_with_range(1, 50, 1)
+        self.limit.set_value(rule.match_limit if rule else 5)
+        row2.append(self.limit)
+        body.append(row2)
+
+        self.enabled = Gtk.CheckButton(label="Enabled while app is open")
+        self.enabled.set_active(rule.enabled if rule else True)
+        body.append(self.enabled)
+        self.notify_sw = Gtk.CheckButton(label="Notify on match")
+        self.notify_sw.set_active(rule.notify if rule else True)
+        body.append(self.notify_sw)
+        self.label_prefix = Gtk.Entry(text=(rule.label_prefix if rule else ""), placeholder_text="Optional label prefix")
+        body.append(self.label_prefix)
+        self.error = Gtk.Label(xalign=0)
+        self.error.add_css_class("error")
+        body.append(self.error)
+
+    def _save(self) -> None:
+        try:
+            parse_query(self.query.get_text())
+            board = self.board.get_text().strip().lower().lstrip("/")
+            if not board:
+                raise ValueError("Board is required")
+            rule = WatchRule(
+                name=self.name.get_text().strip() or f"/{board}/ rule",
+                board=board,
+                query=self.query.get_text().strip(),
+                enabled=self.enabled.get_active(),
+                interval=int(self.interval.get_value()),
+                match_limit=int(self.limit.get_value()),
+                label_prefix=self.label_prefix.get_text().strip(),
+                notify=self.notify_sw.get_active(),
+                id=self.rule_id,
+            )
+        except (ValueError, TypeError) as error:
+            self.error.set_text(str(error))
+            return
+        self.on_save(rule)
+        self.close()
+
+
+class RulesWindow(Adw.Window):
+    def __init__(self, parent: "ThreadsyphonWindow") -> None:
+        super().__init__(transient_for=parent, title="Watchdog rules", modal=False, default_width=520, default_height=420)
+        self.parent_win = parent
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.set_content(root)
+        header = Adw.HeaderBar()
+        root.append(header)
+        add = Gtk.Button(label="Add rule")
+        add.add_css_class("suggested-action")
+        add.connect("clicked", lambda *_: self._edit(None))
+        header.pack_end(add)
+
+        body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        body.set_margin_start(12)
+        body.set_margin_end(12)
+        body.set_margin_top(8)
+        body.set_margin_bottom(12)
+        body.set_vexpand(True)
+        root.append(body)
+
+        note = Gtk.Label(
+            xalign=0,
+            label="Enabled rules scan the catalog while this app is open and auto-add matching threads.",
+        )
+        note.add_css_class("dim-label")
+        note.set_wrap(True)
+        body.append(note)
+
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_vexpand(True)
+        self.list = Gtk.ListBox()
+        self.list.set_selection_mode(Gtk.SelectionMode.NONE)
+        scroll.set_child(self.list)
+        body.append(scroll)
+        self.reload()
+
+    def reload(self) -> None:
+        while True:
+            row = self.list.get_row_at_index(0)
+            if row is None:
+                break
+            self.list.remove(row)
+        for rule in self.parent_win.store.rules:
+            self.list.append(self._row(rule))
+
+    def _row(self, rule: WatchRule) -> Gtk.ListBoxRow:
+        row = Gtk.ListBoxRow()
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        box.set_margin_start(10)
+        box.set_margin_end(10)
+        box.set_margin_top(8)
+        box.set_margin_bottom(8)
+        mid = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        mid.set_hexpand(True)
+        title = Gtk.Label(xalign=0, label=rule.name)
+        title.add_css_class("heading")
+        sub = Gtk.Label(
+            xalign=0,
+            label=f"/{rule.board}/ · {rule.query or '(all)'} · every {rule.interval}s",
+        )
+        sub.add_css_class("dim-label")
+        sub.add_css_class("caption")
+        sub.set_ellipsize(Pango.EllipsizeMode.END)
+        mid.append(title)
+        mid.append(sub)
+        box.append(mid)
+        enabled = Gtk.Switch()
+        enabled.set_active(rule.enabled)
+        enabled.set_valign(Gtk.Align.CENTER)
+
+        def on_enable(sw, _pspec, rid=rule.id):
+            for r in self.parent_win.store.rules:
+                if r.id == rid:
+                    r.enabled = sw.get_active()
+                    break
+            self.parent_win._rules_changed()
+
+        enabled.connect("notify::active", on_enable)
+        box.append(enabled)
+        edit = Gtk.Button(label="Edit")
+        edit.add_css_class("flat")
+        edit.connect("clicked", lambda *_ , r=rule: self._edit(r))
+        box.append(edit)
+        rm = Gtk.Button(label="Remove")
+        rm.add_css_class("flat")
+        rm.connect("clicked", lambda *_ , rid=rule.id: self._remove(rid))
+        box.append(rm)
+        row.set_child(box)
+        return row
+
+    def _edit(self, rule: WatchRule | None) -> None:
+        def on_save(saved: WatchRule) -> None:
+            rules = self.parent_win.store.rules
+            for i, r in enumerate(rules):
+                if r.id == saved.id:
+                    rules[i] = saved
+                    break
+            else:
+                rules.append(saved)
+            self.parent_win._rules_changed()
+            self.reload()
+
+        RuleEditDialog(self, rule, on_save).present()
+
+    def _remove(self, rule_id: str) -> None:
+        self.parent_win.store.rules = [r for r in self.parent_win.store.rules if r.id != rule_id]
+        self.parent_win._rules_changed()
+        self.reload()
+
+
 class ThreadsyphonWindow(Adw.ApplicationWindow):
     def __init__(self, app: "ThreadsyphonApp") -> None:
         super().__init__(application=app, title="threadsyphon", default_width=980, default_height=680)
@@ -247,11 +590,20 @@ class ThreadsyphonWindow(Adw.ApplicationWindow):
         self.events: queue.Queue[dict] = queue.Queue()
         self.manager = WatchManager(self.events.put)
         self.manager.apply_limits(self.store.settings.rate_gap, self.store.settings.cdn_gap)
+        self.catalog = CatalogClient()
+        self.scout = RuleScout(self.events.put, self.catalog)
+        self.scout.set_context(
+            lambda: {f"{c.board}/{c.thread_no}" for c in self.configs.values()},
+            lambda: self.store.settings,
+        )
         self._closing = False
         self._clip_last = ""
+        self._rules_window = None
 
         self._build()
         self._load_configs()
+        self.scout.set_rules(list(self.store.rules))
+        self.scout.start()
         GLib.timeout_add(100, self._drain_events)
         GLib.timeout_add(1500, self._poll_clipboard)
 
@@ -269,6 +621,13 @@ class ThreadsyphonWindow(Adw.ApplicationWindow):
         title = Adw.WindowTitle(title="threadsyphon", subtitle="thread media watcher")
         self.header.set_title_widget(title)
 
+        find_btn = Gtk.Button(label="Find")
+        find_btn.connect("clicked", lambda *_: self._open_find())
+        self.header.pack_start(find_btn)
+        rules_btn = Gtk.Button(label="Rules")
+        rules_btn.add_css_class("flat")
+        rules_btn.connect("clicked", lambda *_: self._open_rules())
+        self.header.pack_start(rules_btn)
         start_all = Gtk.Button(label="Start all")
         start_all.connect("clicked", lambda *_: self._start_all())
         self.header.pack_start(start_all)
@@ -280,6 +639,8 @@ class ThreadsyphonWindow(Adw.ApplicationWindow):
         menu_btn = Gtk.MenuButton()
         menu_btn.set_icon_name("open-menu-symbolic")
         menu = Gio.Menu()
+        menu.append("Find threads", "app.find")
+        menu.append("Watchdog rules", "app.rules")
         menu.append("Preferences", "app.preferences")
         menu.append("About", "app.about")
         menu.append("Quit", "app.quit")
@@ -545,6 +906,19 @@ class ThreadsyphonWindow(Adw.ApplicationWindow):
         try:
             while True:
                 event = self.events.get_nowait()
+                if event.get("type") == "scout":
+                    status = str(event.get("status", ""))
+                    if status == "match":
+                        config = event.get("config")
+                        if isinstance(config, ThreadConfig) and self.add_config_from_scout(config):
+                            msg = f"Rule {event.get('rule_name', '')}: added {config.short_id}"
+                            self._toast(msg)
+                            if event.get("notify") and self.store.settings.notifications:
+                                notify(str(event.get("rule_name") or "Rule"), f"Watching {config.short_id}")
+                        changed = True
+                    elif status == "error":
+                        self._toast(f"Rule error: {event.get('message', '')}")
+                    continue
                 config_id = str(event.get("thread_id", ""))
                 if config_id not in self.configs:
                     continue
@@ -617,15 +991,69 @@ class ThreadsyphonWindow(Adw.ApplicationWindow):
         self.summary.set_text(
             f"{total} thread{'s' if total != 1 else ''}  ·  {active} active  ·  {saved} files  ·  {format_bytes(nbytes) or '0 B'}"
         )
-        self.header.get_title_widget().set_subtitle(
-            f"{active} active · {saved} files" if total else "thread media watcher"
-        )
+        rules_on = sum(1 for r in self.store.rules if r.enabled)
+        base = f"{active} active · {saved} files" if total else "thread media watcher"
+        if rules_on:
+            base += f" · {rules_on} rule{'s' if rules_on != 1 else ''}"
+        self.header.get_title_widget().set_subtitle(base)
 
     def _save(self) -> None:
         try:
-            self.store.save(list(self.configs.values()), self.store.settings)
+            self.store.save(list(self.configs.values()), self.store.settings, self.store.rules)
         except OSError as error:
             self._toast(f"Settings not saved: {error}")
+
+    def _rules_changed(self) -> None:
+        self.scout.set_rules(list(self.store.rules))
+        self._save()
+        self._update_summary()
+
+    def _open_find(self) -> None:
+        FindDialog(self).present()
+
+    def _open_rules(self) -> None:
+        if self._rules_window is None:
+            self._rules_window = RulesWindow(self)
+        else:
+            self._rules_window.reload()
+        self._rules_window.present()
+
+    def add_catalog_hit(self, hit: CatalogThread, label: str = "") -> bool:
+        if any(c.board == hit.board and c.thread_no == hit.no for c in self.configs.values()):
+            return False
+        settings = self.store.settings
+        mode = "original" if self.original_names.get_active() else settings.filename_mode
+        if not self.original_names.get_active() and settings.filename_mode == "original":
+            mode = "server"
+        config = ThreadConfig(
+            hit.url,
+            hit.board,
+            hit.no,
+            default_download_dir(hit.board, hit.no, settings),
+            label,
+            subject=hit.title or hit.display_title,
+            interval=int(self.interval.get_value()),
+            filename_mode=mode,
+            media_filter=settings.media_filter,
+            max_file_mb=settings.max_file_mb,
+            save_gallery=settings.save_gallery,
+            verify_md5=settings.verify_md5,
+            auto_start=True,
+        )
+        self._register_config(config, start=True)
+        self.scout.mark_seen(hit.board, hit.no)
+        self._save()
+        self._update_summary()
+        return True
+
+    def add_config_from_scout(self, config: ThreadConfig) -> bool:
+        if any(c.board == config.board and c.thread_no == config.thread_no for c in self.configs.values()):
+            return False
+        self._register_config(config, start=True)
+        self.scout.mark_seen(config.board, config.thread_no)
+        self._save()
+        self._update_summary()
+        return True
 
     def apply_settings(self, settings: AppSettings) -> None:
         self.store.settings = settings
@@ -765,6 +1193,7 @@ class ThreadsyphonWindow(Adw.ApplicationWindow):
             return False
         self._closing = True
         self._save()
+        self.scout.stop()
         self.manager.stop_all()
         return False
 
@@ -787,6 +1216,12 @@ class ThreadsyphonApp(Adw.Application):
         prefs = Gio.SimpleAction.new("preferences", None)
         prefs.connect("activate", self._preferences)
         self.add_action(prefs)
+        find_a = Gio.SimpleAction.new("find", None)
+        find_a.connect("activate", lambda *_: self.window and self.window._open_find())
+        self.add_action(find_a)
+        rules_a = Gio.SimpleAction.new("rules", None)
+        rules_a.connect("activate", lambda *_: self.window and self.window._open_rules())
+        self.add_action(rules_a)
         about = Gio.SimpleAction.new("about", None)
         about.connect("activate", self._about)
         self.add_action(about)
@@ -795,6 +1230,8 @@ class ThreadsyphonApp(Adw.Application):
         self.add_action(quit_a)
         self.set_accels_for_action("app.quit", ["<primary>q"])
         self.set_accels_for_action("app.preferences", ["<primary>comma"])
+        self.set_accels_for_action("app.find", ["<primary>f"])
+        self.set_accels_for_action("app.rules", ["<primary>r"])
 
     def _preferences(self, *_a) -> None:
         if not self.window:
@@ -810,7 +1247,7 @@ class ThreadsyphonApp(Adw.Application):
             version=__version__,
             comments="Watch 4chan threads and save their media. Built for Linux with GTK4 and libadwaita.",
             license_type=Gtk.License.MIT_X11,
-            website="https://github.com/cicalooo/threadsyphon-source",
+            website="https://github.com/cicalooo/threadsyphon-linux",
         )
         dialog.present()
 

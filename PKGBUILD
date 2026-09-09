@@ -1,6 +1,6 @@
 # Maintainer: local <local@localhost>
 pkgname=threadsyphon
-pkgver=2.0.0
+pkgver=2.1.0
 pkgrel=1
 pkgdesc="Watch 4chan threads and save their media (GTK4/libadwaita)"
 arch=('any')

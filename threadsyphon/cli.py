@@ -7,7 +7,9 @@ import time
 
 from . import __version__
 from .engine import WatchManager, format_bytes
-from .models import ThreadConfig, default_download_dir, parse_thread_url
+from .catalog import CatalogClient, search_catalog
+from .models import ThreadConfig, WatchRule, default_download_dir, parse_thread_url
+from .query import parse_query
 from .storage import ConfigStore, app_config_dir
 
 
@@ -32,6 +34,28 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("watch", help="Run saved watchers without a window")
     sub.add_parser("config", help="Print the config path")
 
+    find_p = sub.add_parser("find", help="Search a board catalog")
+    find_p.add_argument("board")
+    find_p.add_argument("query", nargs="?", default="")
+    find_p.add_argument("--limit", type=int, default=30)
+
+    rules_p = sub.add_parser("rules", help="List or manage watchdog rules")
+    rules_sub = rules_p.add_subparsers(dest="rules_cmd")
+    rules_sub.add_parser("list", help="List rules")
+    r_add = rules_sub.add_parser("add", help="Add a rule")
+    r_add.add_argument("board")
+    r_add.add_argument("query")
+    r_add.add_argument("--name", default="")
+    r_add.add_argument("--interval", type=int, default=120)
+    r_add.add_argument("--limit", type=int, default=5)
+    r_add.add_argument("--disabled", action="store_true")
+    r_rm = rules_sub.add_parser("remove", help="Remove a rule by id prefix or name")
+    r_rm.add_argument("id_or_name")
+    r_en = rules_sub.add_parser("enable", help="Enable a rule")
+    r_en.add_argument("id_or_name")
+    r_dis = rules_sub.add_parser("disable", help="Disable a rule")
+    r_dis.add_argument("id_or_name")
+
     args = parser.parse_args(argv)
     if args.cmd in (None, "gui"):
         from .app import run
@@ -45,6 +69,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "config":
         print(app_config_dir() / "threads.json")
         return 0
+    if args.cmd == "find":
+        return cmd_find(args)
+    if args.cmd == "rules":
+        return cmd_rules(args)
     parser.print_help()
     return 1
 
@@ -137,6 +165,80 @@ def cmd_watch() -> int:
         manager.stop_all()
         store.save(configs)
     return 0
+
+
+def cmd_find(args: argparse.Namespace) -> int:
+    try:
+        parse_query(args.query)
+        hits = search_catalog(CatalogClient(), args.board, args.query)
+    except Exception as error:
+        print(error, file=sys.stderr)
+        return 1
+    if not hits:
+        print("No matches.")
+        return 0
+    for hit in hits[: max(1, args.limit)]:
+        title = (hit.title or hit.body or "").replace("\n", " ")[:70]
+        print(f"{hit.short_id:16}  r={hit.replies:<4} i={hit.images:<4}  {title}")
+    if len(hits) > args.limit:
+        print(f"… {len(hits) - args.limit} more")
+    return 0
+
+
+def _find_rule(store: ConfigStore, key: str) -> WatchRule | None:
+    key_l = key.lower()
+    for rule in store.rules:
+        if rule.id.startswith(key) or rule.name.lower() == key_l:
+            return rule
+    return None
+
+
+def cmd_rules(args: argparse.Namespace) -> int:
+    store = ConfigStore()
+    configs = store.load()
+    cmd = getattr(args, "rules_cmd", None) or "list"
+    if cmd == "list":
+        if not store.rules:
+            print("No rules saved.")
+            return 0
+        for rule in store.rules:
+            state = "on " if rule.enabled else "off"
+            print(f"{rule.id[:8]}  {state}  /{rule.board}/  every {rule.interval}s  {rule.name}  ·  {rule.query}")
+        return 0
+    if cmd == "add":
+        try:
+            parse_query(args.query)
+            rule = WatchRule(
+                name=args.name,
+                board=args.board,
+                query=args.query,
+                enabled=not args.disabled,
+                interval=args.interval,
+                match_limit=args.limit,
+            )
+        except ValueError as error:
+            print(error, file=sys.stderr)
+            return 1
+        store.rules.append(rule)
+        store.save(configs, rules=store.rules)
+        print(f"Added rule {rule.id[:8]}  /{rule.board}/  {rule.query}")
+        return 0
+    if cmd in {"remove", "enable", "disable"}:
+        rule = _find_rule(store, args.id_or_name)
+        if not rule:
+            print("Rule not found.", file=sys.stderr)
+            return 1
+        if cmd == "remove":
+            store.rules = [r for r in store.rules if r.id != rule.id]
+            store.save(configs, rules=store.rules)
+            print(f"Removed {rule.name}")
+            return 0
+        rule.enabled = cmd == "enable"
+        store.save(configs, rules=store.rules)
+        print(f"{'Enabled' if rule.enabled else 'Disabled'} {rule.name}")
+        return 0
+    print("Usage: threadsyphon rules [list|add|remove|enable|disable]", file=sys.stderr)
+    return 1
 
 
 if __name__ == "__main__":

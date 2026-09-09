@@ -171,3 +171,47 @@ def want_media(extension: str, media_filter: str) -> bool:
     if media_filter == "video":
         return ext in VIDEO_EXTS
     return True
+
+
+@dataclass(slots=True)
+class WatchRule:
+    """Catalog scout rule — runs while the GUI is open."""
+
+    name: str
+    board: str
+    query: str
+    enabled: bool = True
+    interval: int = 120
+    match_limit: int = 5
+    thread_interval: int = 0  # 0 = use app default
+    label_prefix: str = ""
+    notify: bool = True
+    id: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.id:
+            self.id = uuid4().hex
+        self.board = self.board.strip().lower().lstrip("/")
+        self.name = self.name.strip() or f"/{self.board}/ rule"
+        self.query = self.query.strip()
+        self.interval = max(60, min(int(self.interval), 3600))
+        self.match_limit = max(1, min(int(self.match_limit), 50))
+        self.thread_interval = max(0, min(int(self.thread_interval or 0), 3600))
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, value: dict) -> "WatchRule":
+        return cls(
+            name=str(value.get("name", "")),
+            board=str(value.get("board", "")),
+            query=str(value.get("query", "")),
+            enabled=bool(value.get("enabled", True)),
+            interval=int(value.get("interval", 120)),
+            match_limit=int(value.get("match_limit", 5)),
+            thread_interval=int(value.get("thread_interval", 0) or 0),
+            label_prefix=str(value.get("label_prefix", "")),
+            notify=bool(value.get("notify", True)),
+            id=str(value.get("id", "")),
+        )

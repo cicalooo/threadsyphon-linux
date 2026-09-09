@@ -108,6 +108,44 @@ systemctl --user enable --now threadsyphon.service
 
 ---
 
+
+## Find threads & watchdog rules
+
+### Find (manual)
+
+In the app: **Find** (or `Ctrl+F`). Pick a board, type a filter, multi-select results → **Add selected**.
+
+CLI:
+
+```bash
+threadsyphon find g 'title:linux min_images:5'
+threadsyphon find wg 'body:wallpaper OR title:desktop'
+```
+
+### Filter syntax
+
+| Example | Meaning |
+|---------|---------|
+| `linux nvidia` | both words in title or OP body |
+| `title:"daily driver"` | phrase in subject |
+| `body:arch` | word in OP comment |
+| `id:12345678` | thread number |
+| `min_images:10` | at least 10 images |
+| `min_replies:50` | at least 50 replies |
+| `sticky:false` | not sticky |
+| `-title:meta` | exclude |
+| `a OR b` | either side |
+
+### Rules (watchdogs while the app is open)
+
+**Rules** (`Ctrl+R`): add a board + query + scout interval (min 60s). While the window is open, enabled rules re-scan the catalog and auto-add new matches (deduped). Rules are saved in config; scouting stops when you quit (download workers keep their normal behavior).
+
+```bash
+threadsyphon rules add g 'min_images:20 title:general' --name 'fat generals' --interval 120
+threadsyphon rules list
+threadsyphon rules disable fat generals
+```
+
 ## Where files live
 
 | What | Path |
