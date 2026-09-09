@@ -128,6 +128,9 @@ threadsyphon find wg 'body:wallpaper OR title:desktop'
 |---------|---------|
 | `linux nvidia` | both words in title or OP body |
 | `title:"daily driver"` | phrase in subject |
+| `/caig/` or `tag:caig` | subject has `/caig/` tag (not body) |
+| `title=:"/caig/ c ai general"` | **exact** full subject |
+| `title^:/caig/` | subject **starts with** |
 | `body:arch` | word in OP comment |
 | `id:12345678` | thread number |
 | `min_images:10` | at least 10 images |

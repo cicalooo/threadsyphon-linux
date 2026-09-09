@@ -290,7 +290,7 @@ class FindDialog(Adw.Window):
 
         hint = Gtk.Label(
             xalign=0,
-            label='Filter: linux  ·  title:"daily" OR body:arch  ·  min_images:10  ·  id:123  ·  -sticky:true',
+            label='Title only: /caig/   or   title:"/caig/"   or   title=:"/caig/ c ai general"  ·  body:…  ·  min_images:10',
         )
         hint.add_css_class("dim-label")
         hint.add_css_class("caption")

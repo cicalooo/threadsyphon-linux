@@ -76,3 +76,37 @@ class QueryTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TitleTagTests(unittest.TestCase):
+    def _t(self, title: str, body: str = "") -> dict:
+        return {
+            "title": title,
+            "body": body,
+            "no": 1,
+            "images": 1,
+            "replies": 1,
+            "board": "g",
+            "sticky": False,
+            "closed": False,
+        }
+
+    def test_slash_tag_is_title_only(self) -> None:
+        q = parse_query("/caig/")
+        self.assertTrue(match_thread(q, self._t("/caig/ c ai general")))
+        self.assertFalse(match_thread(q, self._t("unrelated", "mentions /caig/ in body")))
+
+    def test_bare_word_still_searches_body(self) -> None:
+        q = parse_query("caig")
+        self.assertTrue(match_thread(q, self._t("x", "caig in body")))
+
+    def test_title_exact_and_prefix(self) -> None:
+        full = self._t("/caig/ c ai general")
+        self.assertTrue(match_thread(parse_query('title=:"/caig/ c ai general"'), full))
+        self.assertFalse(match_thread(parse_query('title=:"/caig/"'), full))
+        self.assertTrue(match_thread(parse_query("title^:/caig/"), full))
+        self.assertFalse(match_thread(parse_query("title^:/caig/"), self._t("x /caig/ y")))
+
+    def test_leading_equals_stripped(self) -> None:
+        q = parse_query("=/caig/")
+        self.assertTrue(match_thread(q, self._t("/caig/ c ai general")))
