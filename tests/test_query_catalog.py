@@ -74,10 +74,6 @@ class QueryTests(unittest.TestCase):
         self.assertEqual(store2.rules[0].interval, 90)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TitleTagTests(unittest.TestCase):
     def _t(self, title: str, body: str = "") -> dict:
         return {
@@ -110,3 +106,56 @@ class TitleTagTests(unittest.TestCase):
     def test_leading_equals_stripped(self) -> None:
         q = parse_query("=/caig/")
         self.assertTrue(match_thread(q, self._t("/caig/ c ai general")))
+
+    def test_dangling_operators_rejected(self) -> None:
+        for text in ("OR", "NOT", "linux OR", "OR linux", "linux NOT"):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                parse_query(text)
+
+
+class WatchdogDraftTests(unittest.TestCase):
+    def _t(self, title: str, body: str = "") -> dict:
+        return {
+            "title": title,
+            "body": body,
+            "no": 1,
+            "images": 1,
+            "replies": 1,
+            "board": "g",
+            "sticky": False,
+            "closed": False,
+        }
+
+    def test_draft_uses_slash_tag_and_ignores_body(self) -> None:
+        from threadsyphon.query import watchdog_draft_from_titles
+
+        draft = watchdog_draft_from_titles("g", ["/caig/ C AI General #9"])
+        self.assertEqual(draft.query, "/caig/")
+        self.assertEqual(draft.name, "/caig/")
+        self.assertEqual(draft.label_prefix, "/caig/")
+        nxt = self._t("/caig/ C AI General #10")
+        self.assertTrue(match_thread(parse_query(draft.query), nxt))
+        self.assertFalse(match_thread(parse_query(draft.query), self._t("unrelated", "talks about /caig/ in the OP")))
+
+    def test_draft_skips_board_tag_and_uses_stem(self) -> None:
+        from threadsyphon.query import watchdog_draft_from_titles
+
+        draft = watchdog_draft_from_titles("g", ["/g/ Desktop Thread #12"])
+        self.assertEqual(draft.query, 'title^:"/g/ desktop thread"')
+        self.assertTrue(match_thread(parse_query(draft.query), self._t("/g/ Desktop Thread #13")))
+
+    def test_draft_requires_shared_identifier(self) -> None:
+        from threadsyphon.query import watchdog_draft_from_find_query, watchdog_draft_from_titles
+
+        shared = watchdog_draft_from_titles("g", ["/wdg/ webdev #1", "/wdg/ - Web Development General"])
+        self.assertEqual(shared.query, "/wdg/")
+        with self.assertRaises(ValueError):
+            watchdog_draft_from_titles("g", ["/wdg/ webdev", "/caig/ cai"])
+        with self.assertRaises(ValueError):
+            watchdog_draft_from_find_query("g", "linux")
+        ident = watchdog_draft_from_find_query("g", "/wdg/")
+        self.assertEqual(ident.query, "/wdg/")
+
+
+if __name__ == "__main__":
+    unittest.main()

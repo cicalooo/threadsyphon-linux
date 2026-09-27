@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import html
 import re
-from typing import Any
+from typing import Any, Sequence
 
 
 # /caig/ style board-general tags in titles
@@ -175,10 +175,13 @@ def parse_query(text: str) -> QueryAST:
     while True:
         kind, value, i = _next_token(raw, i)
         if kind == "EOF":
+            if pending_not or not groups[-1]:
+                raise ValueError("Query operator needs a following term.")
             break
         if kind == "OR":
+            if pending_not or not groups[-1]:
+                raise ValueError("OR needs a term on both sides.")
             groups.append([])
-            pending_not = False
             continue
         if kind == "NOT":
             pending_not = True
@@ -301,3 +304,127 @@ def match_thread(query: QueryAST, thread: dict[str, Any]) -> bool:
 
 def filter_threads(query: QueryAST, threads: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [t for t in threads if match_thread(query, t)]
+
+
+# Slash-tags embedded in a subject, e.g. "/wdg/ - Web Development General"
+_EMBEDDED_TAG_RE = re.compile(r"(?:^|[\s\-_|(\[])(/[a-z0-9]{1,20}/)", re.I)
+# Generation / date suffixes that change when a general is re-posted
+_GENERATION_SUFFIX_RE = re.compile(
+    r"(?:\s*[#№]\s*\d+|\s*\(\s*\d{1,5}\s*\)|\s+\d{4}-\d{2}-\d{2})\s*$"
+)
+_TITLE_IDENTIFIER_KINDS = frozenset({"tag", "title", "title_exact", "title_prefix"})
+
+
+@dataclass(frozen=True, slots=True)
+class WatchdogDraft:
+    """Suggested catalog rule derived from thread title identifiers."""
+
+    name: str
+    board: str
+    query: str
+    label_prefix: str = ""
+
+
+def extract_title_tags(title: str, board: str = "") -> list[str]:
+    """Unique /tag/ identifiers in a subject, skipping the board's own /g/ token."""
+    board_l = (board or "").strip().lower().strip("/")
+    tags: list[str] = []
+    for match in _EMBEDDED_TAG_RE.finditer(title or ""):
+        tag = match.group(1).strip("/").lower()
+        if not tag or tag == board_l or tag in tags:
+            continue
+        tags.append(tag)
+    return tags
+
+
+def stable_title_stem(title: str, board: str = "") -> str:
+    """Subject with generation numbers/dates stripped, for prefix matching."""
+    del board  # board tags stay in the stem so title^: still matches "/g/ …"
+    text = _norm_space(title or "")
+    while True:
+        stripped = _GENERATION_SUFFIX_RE.sub("", text).strip(" -_|:")
+        stripped = _norm_space(stripped)
+        if stripped == text:
+            break
+        text = stripped
+    return text
+
+
+def quote_query_value(value: str) -> str:
+    value = (value or "").strip()
+    if not value:
+        return value
+    if re.search(r"\s", value) or any(ch in value for ch in ":\"'"):
+        return '"' + value.replace('"', "") + '"'
+    return value
+
+
+def query_is_title_identifier(query: QueryAST) -> bool:
+    if query.empty:
+        return False
+    return all(clause.kind in _TITLE_IDENTIFIER_KINDS for group in query.groups for clause in group)
+
+
+def watchdog_query_from_title(title: str, board: str = "") -> str:
+    tags = extract_title_tags(title, board)
+    if tags:
+        return " ".join(f"/{tag}/" for tag in tags)
+    stem = stable_title_stem(title, board)
+    if len(stem) < 4:
+        raise ValueError("This thread has no stable title identifier (need a /tag/ or a longer subject).")
+    return f"title^:{quote_query_value(stem)}"
+
+
+def _draft_from_query(board: str, query: str, name: str = "", label_prefix: str = "") -> WatchdogDraft:
+    parsed = parse_query(query)
+    if parsed.empty:
+        raise ValueError("Watchdog query cannot be empty.")
+    if not query_is_title_identifier(parsed):
+        raise ValueError("Watchdog query must match title identifiers, not OP body text.")
+    tags = [clause.value for group in parsed.groups for clause in group if clause.kind == "tag" and not clause.negated]
+    if not name:
+        name = f"/{tags[0]}/" if len(tags) == 1 else query.strip()[:60]
+    if not label_prefix and len(tags) == 1:
+        label_prefix = f"/{tags[0]}/"
+    return WatchdogDraft(name=name.strip()[:60], board=board, query=query.strip(), label_prefix=label_prefix)
+
+
+def watchdog_draft_from_titles(board: str, titles: Sequence[str]) -> WatchdogDraft:
+    """Build one watchdog from subjects that share the same title identifiers."""
+    board = (board or "").strip().lower().strip("/")
+    cleaned = [title.strip() for title in titles if (title or "").strip()]
+    if not cleaned:
+        raise ValueError("Selected threads have no subject; pick one with a title tag like /wdg/.")
+    tag_sets = [extract_title_tags(title, board) for title in cleaned]
+    tagged = [tags for tags in tag_sets if tags]
+    if tagged and len(tagged) != len(tag_sets):
+        raise ValueError("Selected threads do not share a title tag. Select one series (e.g. only /wdg/ threads).")
+    if tagged:
+        shared = [tag for tag in tagged[0] if all(tag in tags for tags in tagged[1:])]
+        if shared:
+            query = " ".join(f"/{tag}/" for tag in shared)
+            return _draft_from_query(board, query)
+        raise ValueError("Selected threads do not share a title tag. Select one series (e.g. only /wdg/ threads).")
+    stems = [stable_title_stem(title, board) for title in cleaned]
+    prefix = stems[0]
+    for stem in stems[1:]:
+        while prefix and not stem.startswith(prefix):
+            prefix = prefix[:-1]
+        prefix = prefix.rstrip(" -_|:")
+    prefix = _norm_space(prefix)
+    if len(prefix) < 4:
+        raise ValueError("Selected threads do not share a title identifier. Select one series.")
+    query = f"title^:{quote_query_value(prefix)}"
+    return WatchdogDraft(name=prefix[:60], board=board, query=query, label_prefix="")
+
+
+def watchdog_draft_from_find_query(board: str, query: str) -> WatchdogDraft:
+    """Use the Find box as a watchdog only when it already names title identifiers."""
+    board = (board or "").strip().lower().strip("/")
+    text = (query or "").strip()
+    parsed = parse_query(text)
+    if parsed.empty:
+        raise ValueError("Select a thread or enter a title identifier (e.g. /wdg/ or title:…).")
+    if not query_is_title_identifier(parsed):
+        raise ValueError("Select a result so the watchdog can match its title identifiers, not OP body text.")
+    return _draft_from_query(board, text)

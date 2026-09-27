@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+import math
 import os
-from pathlib import Path
+from pathlib import Path, PurePath
 import re
 from urllib.parse import urlsplit
 from uuid import uuid4
@@ -21,6 +22,59 @@ FILENAME_MODES = ("original", "server", "numbered")
 MEDIA_FILTERS = ("all", "images", "video")
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
 VIDEO_EXTS = {".webm", ".mp4"}
+WINDOWS_RESERVED_NAMES = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
+
+
+def is_safe_relative_filename(value: object) -> bool:
+    """Accept one plain filename, never a path or device alias."""
+    if not isinstance(value, str) or not value or value in {".", ".."}:
+        return False
+    if value.rstrip(" .") != value:
+        return False
+    if any(ord(char) < 32 or char in '<>:"/\\|?*' for char in value):
+        return False
+    path = PurePath(value)
+    if path.is_absolute() or path.name != value or ".." in path.parts:
+        return False
+    # PurePath drive/root check for Windows-style paths on Linux too.
+    text = str(value)
+    if ":" in text or text.startswith(("\\", "/")):
+        # ":" catches drive letters; leading slashes caught above but be explicit.
+        if ":" in text:
+            return False
+    stem = value.split(".", 1)[0].rstrip(" .").upper()
+    return stem not in WINDOWS_RESERVED_NAMES
+
+
+def _safe_int(value: object, default: int) -> int:
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
+def _bounded_int(value: object, default: int, minimum: int, maximum: int) -> int:
+    return max(minimum, min(_safe_int(value, default), maximum))
+
+
+def _bounded_float(value: object, default: float, minimum: float, maximum: float) -> float:
+    try:
+        number = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError):
+        return default
+    if not math.isfinite(number):
+        return default
+    return max(minimum, min(number, maximum))
+
+
+def _coerce_bool(value: object) -> bool:
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"false", "0", "no", "off", ""}:
+            return False
+        if lowered in {"true", "1", "yes", "on"}:
+            return True
+    return bool(value)
 
 
 @dataclass(slots=True)
@@ -38,12 +92,12 @@ class AppSettings:
     default_root: str = ""
 
     def __post_init__(self) -> None:
-        self.default_interval = max(15, min(int(self.default_interval), 3600))
+        self.default_interval = _bounded_int(self.default_interval, 30, 15, 3600)
         self.media_filter = self.media_filter if self.media_filter in MEDIA_FILTERS else "all"
         self.filename_mode = self.filename_mode if self.filename_mode in FILENAME_MODES else "original"
-        self.max_file_mb = max(0, int(self.max_file_mb))
-        self.rate_gap = max(0.25, min(float(self.rate_gap), 10.0))
-        self.cdn_gap = max(0.05, min(float(self.cdn_gap), 5.0))
+        self.max_file_mb = max(0, _safe_int(self.max_file_mb, 0))
+        self.rate_gap = _bounded_float(self.rate_gap, 1.0, 0.25, 10.0)
+        self.cdn_gap = _bounded_float(self.cdn_gap, 0.25, 0.05, 5.0)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -52,8 +106,28 @@ class AppSettings:
     def from_dict(cls, value: dict | None) -> "AppSettings":
         if not isinstance(value, dict):
             return cls()
-        known = {key: value[key] for key in cls.__dataclass_fields__ if key in value}
-        return cls(**known)
+        kwargs: dict[str, object] = {}
+        converters = {
+            "default_interval": int,
+            "notifications": _coerce_bool,
+            "media_filter": str,
+            "max_file_mb": int,
+            "filename_mode": str,
+            "save_gallery": _coerce_bool,
+            "verify_md5": _coerce_bool,
+            "rate_gap": float,
+            "cdn_gap": float,
+            "watch_clipboard": _coerce_bool,
+            "default_root": str,
+        }
+        for key, converter in converters.items():
+            if key not in value:
+                continue
+            try:
+                kwargs[key] = converter(value[key])
+            except (TypeError, ValueError, OverflowError):
+                continue
+        return cls(**kwargs)
 
 
 @dataclass(slots=True)
@@ -75,13 +149,20 @@ class ThreadConfig:
     original_names: bool = field(default=True, repr=False)
 
     def __post_init__(self) -> None:
+        try:
+            self.thread_no = int(self.thread_no)
+        except (TypeError, ValueError, OverflowError) as error:
+            raise ValueError("Thread number must be a positive integer.") from error
+        if self.thread_no <= 0:
+            raise ValueError("Thread number must be a positive integer.")
         if not self.id:
             self.id = uuid4().hex
-        self.interval = max(15, min(int(self.interval), 3600))
+        self.interval = _bounded_int(self.interval, 30, 15, 3600)
         if self.filename_mode not in FILENAME_MODES:
-            self.filename_mode = "original" if self.original_names else "server"
+            self.filename_mode = "original" if _coerce_bool(self.original_names) else "server"
+        self.original_names = self.filename_mode == "original"
         self.media_filter = self.media_filter if self.media_filter in MEDIA_FILTERS else "all"
-        self.max_file_mb = max(0, int(self.max_file_mb))
+        self.max_file_mb = max(0, _safe_int(self.max_file_mb, 0))
 
     @property
     def display_name(self) -> str:
@@ -100,7 +181,7 @@ class ThreadConfig:
     def from_dict(cls, value: dict) -> "ThreadConfig":
         filename_mode = value.get("filename_mode")
         if filename_mode not in FILENAME_MODES:
-            filename_mode = "original" if value.get("original_names", True) else "server"
+            filename_mode = "original" if _coerce_bool(value.get("original_names", True)) else "server"
         return cls(
             url=str(value["url"]),
             board=str(value["board"]),
@@ -112,9 +193,9 @@ class ThreadConfig:
             filename_mode=str(filename_mode),
             media_filter=str(value.get("media_filter", "all")),
             max_file_mb=int(value.get("max_file_mb", 0) or 0),
-            save_gallery=bool(value.get("save_gallery", True)),
-            verify_md5=bool(value.get("verify_md5", True)),
-            auto_start=bool(value.get("auto_start", True)),
+            save_gallery=_coerce_bool(value.get("save_gallery", True)),
+            verify_md5=_coerce_bool(value.get("verify_md5", True)),
+            auto_start=_coerce_bool(value.get("auto_start", True)),
             id=str(value.get("id", "")),
         )
 
@@ -135,6 +216,8 @@ def parse_thread_url(url: str) -> tuple[str, int, str]:
         raise ValueError("That does not look like a 4chan thread URL.")
     board = match.group(1).lower()
     thread_no = int(match.group(2))
+    if thread_no <= 0:
+        raise ValueError("Thread number must be a positive integer.")
     canonical = f"https://boards.4chan.org/{board}/thread/{thread_no}"
     return board, thread_no, canonical
 
@@ -192,11 +275,13 @@ class WatchRule:
         if not self.id:
             self.id = uuid4().hex
         self.board = self.board.strip().lower().lstrip("/")
+        if not self.board or not re.fullmatch(r"[a-z0-9]+", self.board):
+            raise ValueError("Board must look like g, wg, or mu.")
         self.name = self.name.strip() or f"/{self.board}/ rule"
         self.query = self.query.strip()
-        self.interval = max(60, min(int(self.interval), 3600))
-        self.match_limit = max(1, min(int(self.match_limit), 50))
-        self.thread_interval = max(0, min(int(self.thread_interval or 0), 3600))
+        self.interval = _bounded_int(self.interval, 120, 60, 3600)
+        self.match_limit = _bounded_int(self.match_limit, 5, 1, 50)
+        self.thread_interval = max(0, min(_safe_int(self.thread_interval or 0, 0), 3600))
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -207,11 +292,11 @@ class WatchRule:
             name=str(value.get("name", "")),
             board=str(value.get("board", "")),
             query=str(value.get("query", "")),
-            enabled=bool(value.get("enabled", True)),
+            enabled=_coerce_bool(value.get("enabled", True)),
             interval=int(value.get("interval", 120)),
             match_limit=int(value.get("match_limit", 5)),
             thread_interval=int(value.get("thread_interval", 0) or 0),
             label_prefix=str(value.get("label_prefix", "")),
-            notify=bool(value.get("notify", True)),
+            notify=_coerce_bool(value.get("notify", True)),
             id=str(value.get("id", "")),
         )

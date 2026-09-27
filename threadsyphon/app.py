@@ -31,7 +31,7 @@ from .models import (
     default_root,
     parse_thread_url,
 )
-from .query import parse_query
+from .query import parse_query, watchdog_draft_from_find_query, watchdog_draft_from_titles
 from .scout import RuleScout
 from .storage import ConfigStore
 
@@ -320,7 +320,7 @@ class FindDialog(Adw.Window):
 
         hint = Gtk.Label(
             xalign=0,
-            label='Title only: /caig/   or   title:"/caig/"   or   title=:"/caig/ c ai general"  ·  Tick rows to select/deselect',
+            label='Title only: /caig/   or   title:"/caig/"   or   title=:"/caig/ c ai general"  ·  Tick rows to select/deselect  ·  Add watchdog watches the series',
         )
         hint.add_css_class("dim-label")
         hint.add_css_class("caption")
@@ -370,6 +370,9 @@ class FindDialog(Adw.Window):
         spacer = Gtk.Box()
         spacer.set_hexpand(True)
         actions.append(spacer)
+        watchdog_btn = Gtk.Button(label="Add watchdog")
+        watchdog_btn.connect("clicked", lambda *_: self._add_watchdog())
+        actions.append(watchdog_btn)
         add_btn = Gtk.Button(label="Add selected")
         add_btn.add_css_class("suggested-action")
         add_btn.connect("clicked", lambda *_: self._add_selected())
@@ -458,6 +461,44 @@ class FindDialog(Adw.Window):
         self.status.set_text(f"Added {added}. Selection cleared ({left} still listed).")
         if added:
             self.parent_win._toast(f"Added {added} from Find")
+
+    def _selected_hits(self) -> list[CatalogThread]:
+        hits: list[CatalogThread] = []
+        for row in self._iter_rows():
+            if row.is_checked() and row.hit is not None:
+                hits.append(row.hit)
+        # Fall back to cached hits order for consistency with displayed rows.
+        return hits
+
+    def _watchdog_draft(self) -> WatchRule:
+        selected = self._selected_hits()
+        board = (selected[0].board if selected else self.board.get_text()).strip().lower().strip("/")
+        if selected:
+            draft = watchdog_draft_from_titles(board, [hit.title for hit in selected])
+        else:
+            draft = watchdog_draft_from_find_query(board, self.query.get_text())
+        return WatchRule(
+            name=draft.name,
+            board=draft.board,
+            query=draft.query,
+            label_prefix=draft.label_prefix,
+        )
+
+    def _add_watchdog(self) -> None:
+        try:
+            suggested = self._watchdog_draft()
+        except ValueError as error:
+            self.status.set_text(str(error))
+            return
+
+        def on_save(rule: WatchRule) -> None:
+            added = self.parent_win.add_watch_rule(rule)
+            if added:
+                self.status.set_text(f"Watchdog added: {rule.name} ({rule.query})")
+            else:
+                self.status.set_text(f"Watchdog already exists for {rule.query}.")
+
+        RuleEditDialog(self, suggested, on_save).present()
 
 
 class RuleEditDialog(Adw.Window):
@@ -699,6 +740,7 @@ class ThreadsyphonWindow(Adw.ApplicationWindow):
         self.states: dict[str, dict] = {}
         self.logs: dict[str, deque[str]] = {}
         self.rows: dict[str, ThreadRow] = {}
+        self.worker_tokens: dict[str, str] = {}
         self.events: queue.Queue[dict] = queue.Queue()
         self.manager = WatchManager(self.events.put)
         self.manager.apply_limits(self.store.settings.rate_gap, self.store.settings.cdn_gap)
@@ -917,12 +959,19 @@ class ThreadsyphonWindow(Adw.ApplicationWindow):
             "bytes": 0,
         }
         self.logs[config.id] = deque(maxlen=40)
-        self.manager.add(config)
+        worker = self.manager.add(config)
+        self.worker_tokens[config.id] = str(getattr(worker, "worker_id", ""))
         row = ThreadRow(config)
         self.rows[config.id] = row
         self.list.append(row)
         if start:
-            self.manager.workers[config.id].start()
+            worker.start(publish_id=self._publish_worker_token(config.id))
+
+    def _publish_worker_token(self, config_id: str):
+        def publish(token: str) -> None:
+            self.worker_tokens[config_id] = str(token)
+
+        return publish
 
     def _selected_id(self) -> str | None:
         row = self.list.get_selected_row()
@@ -1021,6 +1070,17 @@ class ThreadsyphonWindow(Adw.ApplicationWindow):
                 if event.get("type") == "scout":
                     status = str(event.get("status", ""))
                     if status == "match":
+                        rule_id = str(event.get("rule_id", ""))
+                        if rule_id and not any(r.id == rule_id and r.enabled for r in self.store.rules):
+                            continue
+                        generation = event.get("rule_generation")
+                        checker = getattr(self.scout, "is_rule_generation_current", None)
+                        if generation is not None and callable(checker):
+                            try:
+                                if not checker(rule_id, generation):
+                                    continue
+                            except (TypeError, ValueError):
+                                continue
                         config = event.get("config")
                         if isinstance(config, ThreadConfig) and self.add_config_from_scout(config):
                             msg = f"Rule {event.get('rule_name', '')}: added {config.short_id}"
@@ -1033,6 +1093,10 @@ class ThreadsyphonWindow(Adw.ApplicationWindow):
                     continue
                 config_id = str(event.get("thread_id", ""))
                 if config_id not in self.configs:
+                    continue
+                event_token = str(event.get("worker_id", ""))
+                current_token = self.worker_tokens.get(config_id, "")
+                if event_token and current_token and event_token != current_token:
                     continue
                 state = self.states.setdefault(config_id, {})
                 old_message, old_status = state.get("message"), state.get("status")
@@ -1171,6 +1235,22 @@ class ThreadsyphonWindow(Adw.ApplicationWindow):
         self._update_summary()
         return True
 
+    def add_watch_rule(self, rule: WatchRule) -> bool:
+        board = rule.board.strip().lower().strip("/")
+        query = rule.query.strip()
+        for existing in self.store.rules:
+            if existing.board == board and existing.query.strip() == query:
+                return False
+        self.store.rules.append(rule)
+        self._rules_changed()
+        try:
+            if self._rules_window is not None:
+                self._rules_window.reload()
+        except Exception:
+            pass
+        self._toast(f"Watchdog added: {rule.name}")
+        return True
+
     def apply_settings(self, settings: AppSettings) -> None:
         self.store.settings = settings
         self.manager.apply_limits(settings.rate_gap, settings.cdn_gap)
@@ -1181,33 +1261,35 @@ class ThreadsyphonWindow(Adw.ApplicationWindow):
 
     def _start_selected(self, *_a) -> None:
         config_id = self._selected_id()
-        if config_id:
+        if config_id and config_id in self.manager.workers:
             self.configs[config_id].auto_start = True
-            self.manager.workers[config_id].resume()
+            self.manager.workers[config_id].start(publish_id=self._publish_worker_token(config_id))
             self._save()
 
     def _pause_selected(self, *_a) -> None:
         config_id = self._selected_id()
-        if config_id:
+        if config_id and config_id in self.manager.workers:
             self.configs[config_id].auto_start = False
             self.manager.workers[config_id].pause()
             self._save()
 
     def _check_selected(self, *_a) -> None:
         config_id = self._selected_id()
-        if config_id:
-            self.manager.workers[config_id].check_now()
+        if config_id and config_id in self.manager.workers:
+            self.manager.workers[config_id].check_now(publish_id=self._publish_worker_token(config_id))
 
     def _start_all(self) -> None:
         for config_id, worker in self.manager.workers.items():
-            self.configs[config_id].auto_start = True
-            worker.resume()
+            if config_id in self.configs:
+                self.configs[config_id].auto_start = True
+                worker.start(publish_id=self._publish_worker_token(config_id))
         self._save()
 
     def _pause_all(self) -> None:
         for config_id, worker in self.manager.workers.items():
-            self.configs[config_id].auto_start = False
-            worker.pause()
+            if config_id in self.configs:
+                self.configs[config_id].auto_start = False
+                worker.pause()
         self._save()
 
     def _open_selected_folder(self, *_a) -> None:
@@ -1259,13 +1341,20 @@ class ThreadsyphonWindow(Adw.ApplicationWindow):
             def on_resp(_d, response):
                 if response != "ok":
                     return
-                worker = self.manager.workers[config_id]
-                was_running = worker.alive and not worker.paused_event.is_set()
-                self.manager.remove(config_id)
+                worker = self.manager.workers.get(config_id)
+                was_running = bool(worker and worker.alive and not worker.paused_event.is_set())
+                if self.manager.remove(config_id) is False:
+                    self._toast("The watcher is still stopping. Try again after its network request times out.")
+                    return
                 config.output_dir = chosen
-                worker = self.manager.add(config)
+                try:
+                    worker = self.manager.add(config)
+                except RuntimeError as error:
+                    self._toast(str(error))
+                    return
+                self.worker_tokens[config_id] = str(getattr(worker, "worker_id", ""))
                 if was_running:
-                    worker.start()
+                    worker.start(publish_id=self._publish_worker_token(config_id))
                 self._selection_changed()
                 self._save()
 
@@ -1291,12 +1380,16 @@ class ThreadsyphonWindow(Adw.ApplicationWindow):
         def on_resp(_d, response):
             if response != "remove":
                 return
-            row = self.rows.pop(config_id)
-            self.list.remove(row)
-            self.manager.remove(config_id)
+            if self.manager.remove(config_id) is False:
+                self._toast("The watcher is still stopping. Try again after its network request times out.")
+                return
+            row = self.rows.pop(config_id, None)
+            if row is not None:
+                self.list.remove(row)
             self.configs.pop(config_id, None)
             self.states.pop(config_id, None)
             self.logs.pop(config_id, None)
+            self.worker_tokens.pop(config_id, None)
             self._save()
             self._selection_changed()
             self._update_summary()
@@ -1309,8 +1402,14 @@ class ThreadsyphonWindow(Adw.ApplicationWindow):
             return False
         self._closing = True
         self._save()
-        self.scout.stop()
-        self.manager.stop_all()
+        if self.scout.stop() is False:
+            self._closing = False
+            self._toast("The rule scout is still stopping. Try closing again after its network request times out.")
+            return True
+        if self.manager.stop_all() is False:
+            self._closing = False
+            self._toast("A watcher is still stopping. Try closing again after its network request times out.")
+            return True
         return False
 
 

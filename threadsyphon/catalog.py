@@ -9,7 +9,7 @@ from typing import Any
 import urllib.error
 import urllib.request
 
-from .engine import API_LIMITER, USER_AGENT, DownloadCancelled
+from .engine import API_LIMITER, USER_AGENT, DownloadCancelled, read_json_response
 from .query import strip_html
 
 
@@ -81,7 +81,7 @@ class CatalogClient:
         API_LIMITER.wait(stop or threading.Event())
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                payload = json.loads(response.read().decode("utf-8"))
+                payload = read_json_response(response)
         except urllib.error.HTTPError as error:
             if error.code == 404:
                 raise ValueError(f"Board /{board}/ was not found.") from error
@@ -100,8 +100,20 @@ class CatalogClient:
         for page in payload:
             if not isinstance(page, dict):
                 continue
-            for row in page.get("threads") or []:
+            raw_threads = page.get("threads")
+            if not isinstance(raw_threads, list):
+                continue
+            for row in raw_threads:
                 if not isinstance(row, dict) or "no" not in row:
+                    continue
+                try:
+                    no = int(row["no"])
+                    replies = int(row.get("replies") or 0)
+                    images = int(row.get("images") or 0)
+                    posted = int(row.get("time") or 0)
+                    if no <= 0 or replies < 0 or images < 0 or posted < 0:
+                        continue
+                except (TypeError, ValueError, OverflowError):
                     continue
                 # Skip board index OP-only noise if no images/replies markers? keep all.
                 title = strip_html(str(row.get("sub") or ""))
@@ -109,14 +121,14 @@ class CatalogClient:
                 out.append(
                     CatalogThread(
                         board=board,
-                        no=int(row["no"]),
+                        no=no,
                         title=title,
                         body=body,
-                        replies=int(row.get("replies") or 0),
-                        images=int(row.get("images") or 0),
+                        replies=replies,
+                        images=images,
                         sticky=bool(row.get("sticky")),
                         closed=bool(row.get("closed")),
-                        time=int(row.get("time") or 0),
+                        time=posted,
                         semantic_url=str(row.get("semantic_url") or ""),
                     )
                 )

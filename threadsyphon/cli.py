@@ -13,6 +13,35 @@ from .query import parse_query
 from .storage import ConfigStore, app_config_dir
 
 
+def _positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be an integer") from error
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return parsed
+
+
+def _nonnegative_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be an integer") from error
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be zero or greater")
+    return parsed
+
+
+def _save_config(store: ConfigStore, configs: list[ThreadConfig], rules: list[WatchRule] | None = None) -> bool:
+    try:
+        store.save(configs, rules=rules)
+    except OSError as error:
+        print(f"Could not save configuration: {error}", file=sys.stderr)
+        return False
+    return True
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="threadsyphon",
@@ -26,7 +55,7 @@ def main(argv: list[str] | None = None) -> int:
     add = sub.add_parser("add", help="Add a thread to the watch list")
     add.add_argument("url")
     add.add_argument("--dir", dest="directory", default="")
-    add.add_argument("--interval", type=int, default=0)
+    add.add_argument("--interval", type=_nonnegative_int, default=0)
     add.add_argument("--label", default="")
     add.add_argument("--no-start", action="store_true")
 
@@ -37,7 +66,7 @@ def main(argv: list[str] | None = None) -> int:
     find_p = sub.add_parser("find", help="Search a board catalog")
     find_p.add_argument("board")
     find_p.add_argument("query", nargs="?", default="")
-    find_p.add_argument("--limit", type=int, default=30)
+    find_p.add_argument("--limit", type=_positive_int, default=30)
 
     rules_p = sub.add_parser("rules", help="List or manage watchdog rules")
     rules_sub = rules_p.add_subparsers(dest="rules_cmd")
@@ -46,8 +75,8 @@ def main(argv: list[str] | None = None) -> int:
     r_add.add_argument("board")
     r_add.add_argument("query")
     r_add.add_argument("--name", default="")
-    r_add.add_argument("--interval", type=int, default=120)
-    r_add.add_argument("--limit", type=int, default=5)
+    r_add.add_argument("--interval", type=_positive_int, default=120)
+    r_add.add_argument("--limit", type=_positive_int, default=5)
     r_add.add_argument("--disabled", action="store_true")
     r_rm = rules_sub.add_parser("remove", help="Remove a rule by id prefix or name")
     r_rm.add_argument("id_or_name")
@@ -105,7 +134,8 @@ def cmd_add(args: argparse.Namespace) -> int:
         auto_start=not args.no_start,
     )
     configs.append(config)
-    store.save(configs)
+    if not _save_config(store, configs):
+        return 1
     print(f"Added {canonical}")
     print(f"Saving to {folder}")
     return 0
@@ -138,7 +168,12 @@ def cmd_watch() -> int:
         if config.auto_start:
             worker.start()
             started += 1
+    if started == 0:
+        manager.stop_all()
+        print("No auto-start watchers are enabled.", file=sys.stderr)
+        return 1
     print(f"Watching {started}/{len(configs)} threads. Ctrl+C to stop.")
+    save_ok = True
     try:
         while True:
             try:
@@ -162,9 +197,13 @@ def cmd_watch() -> int:
     except KeyboardInterrupt:
         print("\nStopping…")
     finally:
-        manager.stop_all()
-        store.save(configs)
-    return 0
+        stopped_ok = manager.stop_all()
+        if not stopped_ok:
+            print("A watcher is still stopping; configuration was not saved.", file=sys.stderr)
+            save_ok = False
+        else:
+            save_ok = _save_config(store, configs)
+    return 0 if save_ok else 1
 
 
 def cmd_find(args: argparse.Namespace) -> int:
@@ -220,7 +259,8 @@ def cmd_rules(args: argparse.Namespace) -> int:
             print(error, file=sys.stderr)
             return 1
         store.rules.append(rule)
-        store.save(configs, rules=store.rules)
+        if not _save_config(store, configs, rules=store.rules):
+            return 1
         print(f"Added rule {rule.id[:8]}  /{rule.board}/  {rule.query}")
         return 0
     if cmd in {"remove", "enable", "disable"}:
@@ -230,11 +270,13 @@ def cmd_rules(args: argparse.Namespace) -> int:
             return 1
         if cmd == "remove":
             store.rules = [r for r in store.rules if r.id != rule.id]
-            store.save(configs, rules=store.rules)
+            if not _save_config(store, configs, rules=store.rules):
+                return 1
             print(f"Removed {rule.name}")
             return 0
         rule.enabled = cmd == "enable"
-        store.save(configs, rules=store.rules)
+        if not _save_config(store, configs, rules=store.rules):
+            return 1
         print(f"{'Enabled' if rule.enabled else 'Disabled'} {rule.name}")
         return 0
     print("Usage: threadsyphon rules [list|add|remove|enable|disable]", file=sys.stderr)

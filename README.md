@@ -115,6 +115,8 @@ systemctl --user enable --now threadsyphon.service
 
 In the app: **Find** (or `Ctrl+F`). Pick a board, type a filter, multi-select results → **Add selected**.
 
+**Find → Add watchdog** turns a catalog hit into a rule — from the subject's `/tag/` (skipping the board's own tag) or a stable title prefix (generation numbers like `#12` stripped). Next thread in the series gets picked up automatically.
+
 CLI:
 
 ```bash
